@@ -1,54 +1,43 @@
 import os
-import shutil
 import torch
-from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
 
-def copy_files_not_in_B(A_path, B_path):
-    if not os.path.exists(B_path):
-        os.makedirs(B_path)
+# ===== 路径配置 =====
+base_model_path = r"E:\liworkplace\lora - 副本\deepseek-llm-7B-chat-lora-ft\model\deepseek-ai\deepseek-llm-7b-chat"
+lora_path = r"E:\liworkplace\lora - 副本\deepseek-llm-7B-chat-lora-ft\output\deepseek-mutil-test-2"
+save_path = r"E:\liworkplace\lora - 副本\deepseek-llm-7B-chat-lora-ft\output\merge_model-2"
 
-    files_in_A = os.listdir(A_path)
-    files_in_A = set([f for f in files_in_A if not (".bin" in f or "safetensors" in f)])
-    files_in_B = set(os.listdir(B_path))
+os.makedirs(save_path, exist_ok=True)
 
-    for file in files_in_A - files_in_B:
-        src = os.path.join(A_path, file)
-        dst = os.path.join(B_path, file)
-
-        if os.path.isdir(src):
-            shutil.copytree(src, dst)
-        else:
-            shutil.copy2(src, dst)
 
 def merge_lora():
-    base_model_path = r"E:\liworkplace\lora - 副本\deepseek-llm-7B-chat-lora-ft\model\deepseek-ai\deepseek-llm-7b-chat"
-    lora_path = r"E:\liworkplace\lora - 副本\deepseek-llm-7B-chat-lora-ft\output\deepseek-mutil-test-2"
-    save_path = r"E:\liworkplace\lora - 副本\deepseek-llm-7B-chat-lora-ft\output\merge_model"
-
     print("加载 tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(base_model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(base_model_path, use_fast=False)
 
-    print("加载 base 模型...")
-    model = AutoModelForCausalLM.from_pretrained(
+    print("加载基础模型（CPU）...")
+    base_model = AutoModelForCausalLM.from_pretrained(
         base_model_path,
-        torch_dtype=torch.float16,
-        device_map="auto"
+        device_map="cpu",              # ✅ 强制 CPU
+        torch_dtype=torch.float32      # ✅ CPU 必须 float32
     )
 
     print("加载 LoRA...")
-    model = PeftModel.from_pretrained(model, lora_path)
+    model = PeftModel.from_pretrained(
+        base_model,
+        lora_path,
+        device_map="cpu"               # ✅ 同样 CPU
+    )
 
-    print("开始 merge...")
-    merged_model = model.merge_and_unload()
+    print("开始合并 LoRA...")
+    model = model.merge_and_unload()   # 🔥 核心步骤
 
     print("保存模型...")
+    model.save_pretrained(save_path)
     tokenizer.save_pretrained(save_path)
-    merged_model.save_pretrained(save_path)
 
-    copy_files_not_in_B(base_model_path, save_path)
+    print("✅ 合并完成！保存路径：", save_path)
 
-    print(f"✅ 合并完成，保存路径：{save_path}")
 
 if __name__ == "__main__":
     merge_lora()
