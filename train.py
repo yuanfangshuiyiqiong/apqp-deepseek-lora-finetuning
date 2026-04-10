@@ -3,6 +3,7 @@
 # =========================
 import gc
 import os
+import json
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 
@@ -13,10 +14,39 @@ output_dir = "./output/deepseek-mutil-test"
 # 优先使用 8bit；也提供可选方案：使用 fp16（当 bitsandbytes 不可用/加载失败时自动切换）
 QUANT_MODE = os.getenv("QUANT_MODE", "8bit").lower()  # "8bit" or "fp16"
 
-tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-if tokenizer.pad_token is None:
-    # DeepSeek 类模型通常没有显式 pad_token，用 eos_token 作为 padding 以避免 collator/padding 报错
-    tokenizer.pad_token = tokenizer.eos_token
+def load_tokenizer(model_dir: str):
+    """
+    重要：在你当前 transformers 环境下，AutoTokenizer 会出现“中文被吞掉（encode 为空）”的问题。
+    这里直接用 tokenizer.json 构造 PreTrainedTokenizerFast，确保中文可正确编码/解码。
+    """
+    from transformers import PreTrainedTokenizerFast
+
+    cfg_path = os.path.join(model_dir, "tokenizer_config.json")
+    tok_path = os.path.join(model_dir, "tokenizer.json")
+
+    bos = "<｜begin▁of▁sentence｜>"
+    eos = "<｜end▁of▁sentence｜>"
+    pad = "<｜end▁of▁sentence｜>"
+    def _tok_content(v, default: str) -> str:
+        if isinstance(v, str):
+            return v
+        if isinstance(v, dict):
+            return v.get("content") or default
+        return default
+    if os.path.exists(cfg_path):
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        bos = _tok_content(cfg.get("bos_token"), bos)
+        eos = _tok_content(cfg.get("eos_token"), eos)
+        pad = _tok_content(cfg.get("pad_token"), pad)
+
+    tok = PreTrainedTokenizerFast(tokenizer_file=tok_path, bos_token=bos, eos_token=eos, pad_token=pad)
+    # 保险：确保 pad_token 存在
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    return tok
+
+tokenizer = load_tokenizer(model_path)
 
 print("分词器加载完成")
 
@@ -35,29 +65,24 @@ def process_data(example):
     else:
         prompt = f"### 指令：{instruction}\n### 输出："
 
-    prompt_ids = tokenizer(
-        prompt,
-        truncation=True,
-        max_length=MAX_LENGTH,
-        add_special_tokens=False
-    )["input_ids"]
+    # 与「整段一次 tokenize」相比：prompt / answer 分开编码再拼接，保证前缀长度与 input_ids 严格对齐；
+    # 且统一 add_special_tokens=False，避免 full 默认带 BOS 而 prompt 没有导致 mask 错位。
+    prompt_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    answer_ids = tokenizer(output, add_special_tokens=False)["input_ids"]
+    if tokenizer.eos_token_id is not None:
+        answer_ids = answer_ids + [tokenizer.eos_token_id]
 
-    full = tokenizer(
-        prompt + output,
-        truncation=True,
-        max_length=MAX_LENGTH,
-        padding="max_length"
-    )
+    full_ids = prompt_ids + answer_ids
+    if len(full_ids) > MAX_LENGTH:
+        full_ids = full_ids[:MAX_LENGTH]
 
-    input_ids = full["input_ids"]
-    attention_mask = full["attention_mask"]
+    pad_len = MAX_LENGTH - len(full_ids)
+    input_ids = full_ids + [tokenizer.pad_token_id] * pad_len
+    attention_mask = [1] * len(full_ids) + [0] * pad_len
 
-    # 只训练答案部分
-    labels = input_ids.copy()
-    prompt_len = min(len(prompt_ids), MAX_LENGTH)
-    labels[:prompt_len] = [-100] * prompt_len
-    # 把 padding 的 token 也 mask 掉，避免无意义梯度/影响损失
-    labels = [(-100 if mask == 0 else token_id) for token_id, mask in zip(labels, attention_mask)]
+    prompt_len = min(len(prompt_ids), len(full_ids))
+    # 只训练答案部分（含 eos）；prompt 与 padding 在 labels 中置 -100
+    labels = [-100] * prompt_len + full_ids[prompt_len:] + [-100] * pad_len
 
     return {
         "input_ids": input_ids,
