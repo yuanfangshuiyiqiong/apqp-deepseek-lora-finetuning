@@ -60,7 +60,7 @@ def load_tokenizer(model_dir: str):
 
 def load_model(model_path: str):
     """
-    4-bit 量化加载模型，支持自动 Fallback 到 CPU。
+    优化后的加载函数：强制 GPU 部署，防止自动 CPU Offload。
     """
     print(f"🚀 正在加载模型: {model_path}")
     
@@ -68,43 +68,70 @@ def load_model(model_path: str):
         load_in_4bit=True,
         bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4"
+        bnb_4bit_quant_type="nf4",
+        # 移除可能引起冲突的冗余配置，保持核心量化参数
     )
 
     try:
+        # 针对 RTX 3060 12G，强制使用第一块显卡
+        # 使用 {"": 0} 而不是 "auto" 可以防止 transformers 自动做分片(Offload)
+        forced_device_map = {"": 0} if torch.cuda.is_available() else None
+
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             quantization_config=bnb_config,
-            device_map="auto",
+            device_map=forced_device_map, # 👈 关键点：强制全量入库显存
             trust_remote_code=True,
-            low_cpu_mem_usage=True
+            low_cpu_mem_usage=True,
+            dtype=torch.float16 # 👈 修复 torch_dtype 警告
         )
         return model
     except Exception as e:
-        print(f"⚠️ GPU 加载失败，正在尝试 CPU Fallback。错误详情: {e}")
+        print(f"⚠️ GPU 强制加载失败 (可能是显存碎片或配置冲突)，切换至 CPU 模式。")
+        print(f"错误细节: {e}")
+        
+        # CPU 备选方案
         return AutoModelForCausalLM.from_pretrained(
             model_path,
             device_map="cpu",
-            torch_dtype=torch.float32,
+            dtype=torch.float32, 
             trust_remote_code=True,
             low_cpu_mem_usage=True
         )
+import time
 
 def clear_gpu(model):
     """
-    彻底释放显存。
+    深度清理显存，确保显存驱动彻底回收空间。
     """
-    print("🧹 正在清理显存并卸载模型...")
+    print("🧹 正在执行深度显存清理...")
+    # 1. 尝试将模型移至 CPU (有时有助于释放)
+    if model is not None:
+        model.to("cpu")
+    
+    # 2. 删除引用
     del model
+    
+    # 3. 强制垃圾回收
     gc.collect()
+    gc.collect() # 两次回收确保循环引用被打破
+    
+    # 4. 清理 CUDA 缓存
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    print("✅ 显存已释放。")
+    
+    # 5. 短暂休眠，给显卡驱动响应时间
+    time.sleep(1)
+    print("✅ 显存清理完毕。")
 
 def generate_response(model, tokenizer, prompt: str):
     """
-    执行推理，支持自动设备映射。
+    执行推理，增加 max_new_tokens 以防止回答截断。
     """
+    # 构建 DeepSeek Chat 的 Prompt 模板（如果是 Chat 模型，建议加上模板引导）
+    # 如果你的模型是 Chat 版，建议取消下面两行的注释：
+    # prompt = f"User: {prompt}\n\nAssistant:"
+    
     inputs = tokenizer(
         prompt, 
         return_tensors="pt", 
@@ -113,28 +140,26 @@ def generate_response(model, tokenizer, prompt: str):
         padding=False
     )
     
-    # 获取模型实际所在的设备 (处理 device_map="auto" 的多卡或混合部署情况)
     target_device = next(model.parameters()).device
     inputs = {k: v.to(target_device) for k, v in inputs.items()}
 
     with torch.inference_mode():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=64,
-            do_sample=False,
+            max_new_tokens=512,        # 👈 从 64 增加到 512，确保回答完整
+            do_sample=True,            # 开启采样，让语言更自然
+            temperature=0.7,           # 适度的创造力
+            top_p=0.9,
+            repetition_penalty=1.1,    # 👈 防止生成重复内容
             pad_token_id=tokenizer.pad_token_id,
         )
     
-    # 仅解码新生成的 token 部分
-    # input_len = inputs["input_ids"].shape[1]
-    # return tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
+    # 获取输入序列的长度
+    input_len = inputs["input_ids"].shape[1]
     
-    # 按照需求返回完整解码（如果需要纯答案，可改用上面的切片逻辑）
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-# ==========================================
-# 3. 运行逻辑
-# ==========================================
+    # 仅解码生成的部分（不包含原始问题）
+    # 这样可以清爽地对比 Base 和 Merge 的纯回答内容
+    return tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
 
 def run_compare():
     # --- 配置区 ---
