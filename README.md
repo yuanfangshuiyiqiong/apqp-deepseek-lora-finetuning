@@ -168,3 +168,36 @@ David Li
 ## 📜 License
 
 MIT License
+
+---
+
+## Local JSONL RAG v1
+
+This project includes a minimal offline RAG pipeline for manually prepared enterprise knowledge files.
+
+1. Put cleaned `.txt`, `.md`, or `.json` files under `knowledge_docs/`.
+2. Build the local JSONL vector store:
+
+```bash
+python -m back.rag.build_vector_store --input-dir knowledge_docs --output knowledge_base/vector_store.jsonl
+```
+
+3. Start the FastAPI backend. On startup, the backend loads `knowledge_base/vector_store.jsonl` when it exists.
+4. Chat requests still use `/chat/completions`; before generation, the backend retrieves relevant chunks and injects them into the prompt.
+
+The JSONL record format is:
+
+```json
+{
+  "id": "doc_001_chunk_0001",
+  "text": "knowledge chunk text",
+  "embedding": [0.01, 0.02],
+  "metadata": {
+    "source": "apqp_rag_sample.md",
+    "chunk_index": 1,
+    "category": "APQP"
+  }
+}
+```
+
+The default embedding backend is a deterministic local hashing embedder, so it works without downloading an embedding model. It can be replaced later with a stronger local embedding model behind the same JSONL format.
